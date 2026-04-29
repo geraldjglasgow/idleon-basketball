@@ -1,0 +1,1 @@
+this script was written on a 27" montior at 1080p resolution
