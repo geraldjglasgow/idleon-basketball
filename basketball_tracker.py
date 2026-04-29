@@ -1,23 +1,24 @@
-"""Tracks the basketball's position via OpenCV template matching.
+"""Tracks the basketball's position via HSV color masking.
 
-The template at `assets/middle_basketball.png` is a small crop of the middle
-of the ball (the orange-with-seams pattern). We match that template against
-each captured frame; the best-match location is reported as a screen-space
-bounding box matching the template's dimensions.
+The basketball is a bright orange ball on a dark blue starry sky — its
+hue is distinctive enough that masking orange pixels and taking the
+largest blob is far more robust than template matching against a sharp
+ball.png. In particular this survives motion blur during a shot (orange
+pixels stay orange when smeared) and partial occlusion when the
+character is holding the ball (some orange is still visible).
+
+We filter blobs by area + aspect ratio so other orange shapes on the
+HUD/court (rim, backboard, UI text) don't get picked up.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import cv2
 import numpy as np
 
 from screen_capture import Region
-
-
-TEMPLATE_PATH = Path(__file__).parent / "assets" / "middle_basketball.png"
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,7 @@ class BasketballSample:
     top: int
     width: int
     height: int
-    confidence: float
+    confidence: float  # blob area in pixels — higher = more orange detected
 
     @property
     def center(self) -> tuple[int, int]:
@@ -36,52 +37,59 @@ class BasketballSample:
 
 
 class BasketballTracker:
-    # cv2.matchTemplate with TM_CCOEFF_NORMED returns values in [-1, 1];
-    # 0.7 is a conservative threshold for "actually visible".
-    MIN_CONFIDENCE = 0.7
-    # Match against grayscale at half resolution — ~12× cheaper than full-res
-    # BGR matching against a full-monitor frame. Reported coordinates are
-    # rescaled back to screen space.
-    DOWNSCALE = 2
+    # Bright basketball orange in OpenCV HSV (H: 0-179). Centered around 10-15;
+    # high saturation + value to avoid muted UI orange.
+    ORANGE_HSV_LOW = np.array([5, 120, 100], dtype=np.uint8)
+    ORANGE_HSV_HIGH = np.array([20, 255, 255], dtype=np.uint8)
 
-    def __init__(self, template_path: Path | str = TEMPLATE_PATH) -> None:
-        path = Path(template_path)
-        template = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        if template is None:
-            raise FileNotFoundError(f"basketball template not found: {path}")
-        scaled = cv2.resize(
-            template,
-            None,
-            fx=1 / self.DOWNSCALE,
-            fy=1 / self.DOWNSCALE,
-            interpolation=cv2.INTER_AREA,
-        )
-        self.template = scaled
-        self.h, self.w = scaled.shape[:2]
-        # Full-resolution dims for the bbox we report back to callers.
-        self.full_h = self.h * self.DOWNSCALE
-        self.full_w = self.w * self.DOWNSCALE
+    # Filter blobs to ball-like shapes. The rim is wide-thin so its aspect
+    # falls outside the tolerance; the backboard column is tall-thin and
+    # huge area. UI orange is small.
+    MIN_BLOB_AREA = 400
+    MAX_BLOB_AREA = 12000
+    MIN_ASPECT = 0.5  # height / width
+    MAX_ASPECT = 2.0
+
+    def __init__(self) -> None:
+        # No template needed — pure color detector.
+        pass
 
     def read(self, frame: np.ndarray, frame_origin: Region) -> BasketballSample | None:
-        """Locate the basketball in `frame`. Returns None if not confidently found."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        scaled = cv2.resize(
-            gray,
-            None,
-            fx=1 / self.DOWNSCALE,
-            fy=1 / self.DOWNSCALE,
-            interpolation=cv2.INTER_AREA,
-        )
-        if scaled.shape[0] < self.h or scaled.shape[1] < self.w:
+        """Find the largest orange blob meeting size + aspect filters.
+        Returns None if no candidate qualifies."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.ORANGE_HSV_LOW, self.ORANGE_HSV_HIGH)
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n_labels <= 1:
             return None
-        result = cv2.matchTemplate(scaled, self.template, cv2.TM_CCOEFF_NORMED)
-        _, max_v, _, max_loc = cv2.minMaxLoc(result)
-        if max_v < self.MIN_CONFIDENCE:
+
+        best: tuple[int, int, int, int, int] | None = None  # (area, x, y, w, h)
+        for i in range(1, n_labels):
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            area = int(stats[i, cv2.CC_STAT_AREA])
+
+            if area < self.MIN_BLOB_AREA or area > self.MAX_BLOB_AREA:
+                continue
+            if w == 0 or h == 0:
+                continue
+            aspect = h / w
+            if aspect < self.MIN_ASPECT or aspect > self.MAX_ASPECT:
+                continue
+
+            if best is None or area > best[0]:
+                best = (area, x, y, w, h)
+
+        if best is None:
             return None
+
+        area, x, y, w, h = best
         return BasketballSample(
-            left=max_loc[0] * self.DOWNSCALE + frame_origin["left"],
-            top=max_loc[1] * self.DOWNSCALE + frame_origin["top"],
-            width=self.full_w,
-            height=self.full_h,
-            confidence=float(max_v),
+            left=x + frame_origin["left"],
+            top=y + frame_origin["top"],
+            width=w,
+            height=h,
+            confidence=float(area),
         )

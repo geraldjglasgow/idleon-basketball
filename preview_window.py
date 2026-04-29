@@ -26,12 +26,37 @@ class LabeledBox:
 
 
 class PreviewWindow:
-    def __init__(self, window_name: str = "idleon-basketball preview") -> None:
+    LIGHTWEIGHT_CANVAS_SIZE = (320, 400)  # (width, height)
+
+    def __init__(
+        self,
+        window_name: str = "idleon-basketball preview",
+        lightweight: bool = False,
+    ) -> None:
         self.window_name = window_name
+        self.lightweight = lightweight
         self._last_tick = time.perf_counter()
         self._frames_since_tick = 0
         self._fps = 0.0
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        if lightweight:
+            w, h = self.LIGHTWEIGHT_CANVAS_SIZE
+            cv2.resizeWindow(self.window_name, w, h)
+
+    def show_status(self, lines: list[str]) -> bool:
+        """Render only a debug box with `lines` onto a small dark canvas —
+        useful when there's no captured frame yet (e.g. during the lobby
+        phase). Same return semantics as `show`."""
+        w, h = self.LIGHTWEIGHT_CANVAS_SIZE
+        annotated = np.full((h, w, 3), 30, dtype=np.uint8)
+        self._draw_debug_box(annotated, lines)
+        cv2.imshow(self.window_name, annotated)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            return False
+        if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+            return False
+        return True
 
     def show(
         self,
@@ -39,17 +64,25 @@ class PreviewWindow:
         overlays: list[LabeledBox] | None = None,
         extra_debug: dict[str, str] | None = None,
     ) -> bool:
-        """Render one frame. Returns False if the user requested quit."""
-        self._update_fps()
+        """Render one frame. Returns False if the user requested quit.
 
-        annotated = frame.copy()
-        for box in overlays or []:
-            self._draw_overlay(annotated, box)
+        In lightweight mode the captured frame and overlays are ignored —
+        only the debug box is rendered onto a small dark canvas."""
+        self._update_fps()
 
         lines = [f"FPS: {self._fps:.1f}"]
         if extra_debug:
             lines.extend(f"{k}: {v}" for k, v in extra_debug.items())
-        self._draw_debug_box(annotated, lines)
+
+        if self.lightweight:
+            w, h = self.LIGHTWEIGHT_CANVAS_SIZE
+            annotated = np.full((h, w, 3), 30, dtype=np.uint8)
+            self._draw_debug_box(annotated, lines)
+        else:
+            annotated = frame.copy()
+            for box in overlays or []:
+                self._draw_overlay(annotated, box)
+            self._draw_debug_box(annotated, lines)
 
         cv2.imshow(self.window_name, annotated)
 

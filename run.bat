@@ -1,2 +1,4 @@
 @echo off
-"%~dp0venv\Scripts\python.exe" "%~dp0main.py" %*
+cd /d "%~dp0"
+"venv\Scripts\python.exe" main.py %*
+pause

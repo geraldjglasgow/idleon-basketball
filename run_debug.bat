@@ -1,5 +1,5 @@
 @echo off
-REM Launch the basketball bot with full game stream + tracker overlay.
+REM Same as run.bat but opens the tracker preview window.
 cd /d "%~dp0"
-"venv\Scripts\python.exe" game.py --mode debug %*
+"venv\Scripts\python.exe" main.py --debug %*
 pause
