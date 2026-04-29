@@ -98,7 +98,9 @@ def run(
         traj = record.get("trajectory") or []
         if rx is None or ry is None:
             return
-        outcome = classify_outcome(traj, rx, ry)
+        outcome = classify_outcome(
+            traj, rx, ry, scored=record.get("scored")
+        )
         strategy.notify_outcome(outcome)
         print(f"[strategy] throw outcome: {outcome}")
 

@@ -338,18 +338,30 @@ class SimpleRimStrategy:
 
 
 def classify_outcome(
-    trajectory: list, rim_x: int, rim_y: int, tolerance_px: int = 30
+    trajectory: list,
+    rim_x: int,
+    rim_y: int,
+    scored: bool | None = None,
+    tolerance_px: int = 30,
 ) -> str:
-    """Classify a thrown shot's outcome from its trajectory.
+    """Classify a thrown shot's outcome.
 
-    Returns one of:
+    If `scored` is True (the recorder confirmed the score went up after
+    this throw), the result is "make" regardless of what the trajectory
+    looked like — a backboard rebound that falls through the rim might
+    bounce back too late for our fixed-window trajectory capture, so we
+    trust the score signal as ground truth.
+
+    Otherwise the trajectory is inspected:
       "make"       — descent crossing of rim_y is within tolerance of rim_x
       "undershoot" — ball fell short / crossed rim_y left of the rim
       "overshoot"  — ball crossed rim_y right of the rim, OR ball passed
                      the rim horizontally while above rim level (= it
-                     soared over and likely bounced off the backboard)
+                     soared over the rim — likely a backboard hit)
       "unknown"    — trajectory empty
     """
+    if scored is True:
+        return "make"
     if not trajectory:
         return "unknown"
 
