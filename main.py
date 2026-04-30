@@ -1,7 +1,6 @@
 import argparse
 
 import game
-from hotkey_listener import HotkeyListener
 from lobby import start_game
 from preview_window import PreviewWindow
 
@@ -31,22 +30,18 @@ def main() -> None:
     else:
         preview_mode = "off"
 
-    listener = HotkeyListener()
-    listener.start()
-    print("F1: enable auto-throwing | F2: disable auto-throwing | Ctrl+C: quit")
-
+    print("Idleon basketball bot — Ctrl+C to quit")
     preview: PreviewWindow | None = None
     if preview_mode != "off":
         preview = PreviewWindow(lightweight=(preview_mode == "light"))
     try:
         start_game(preview=preview)
-        game.run(preview=preview, hotkey_listener=listener)
+        game.run(preview=preview)
     except KeyboardInterrupt:
         print("[main] stopped")
     finally:
         if preview is not None:
             preview.close()
-        listener.stop()
 
 
 if __name__ == "__main__":

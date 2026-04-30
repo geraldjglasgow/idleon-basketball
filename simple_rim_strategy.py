@@ -86,6 +86,11 @@ class SimpleRimStrategy:
     # streak frame in the appropriate direction. Grows with the streak so
     # we converge on a working release within a handful of throws.
     DIRECTIONAL_CORRECTION_STEP_PX = 30
+    # Cap on the cumulative directional correction. Without this, a long
+    # streak of undershoots could push target_dy hundreds of pixels off,
+    # right out of the ball's actual swing range — and then nothing
+    # would ever match. ±90 keeps us within ~3 streak-steps' worth.
+    DIRECTIONAL_CORRECTION_MAX_PX = 90
 
     def __init__(self, throws_log_path: Path | str) -> None:
         self.makes: list[_Make] = self._load(Path(throws_log_path))
@@ -96,6 +101,11 @@ class SimpleRimStrategy:
         # progressively-different make to break the pattern.
         self._last_observed_score: int | None = None
         self._misses_since_score: int = 0
+        # Throttled "why I'm not throwing" diagnostic — logged at most
+        # once per second so the console doesn't get spammed with
+        # per-frame chatter.
+        self._last_wait_log_at: float = 0.0
+        self._last_wait_reason: str = ""
         # Directional outcome streaks — set by notify_outcome based on the
         # latest throw's trajectory analysis. Used to bias the dy target
         # in a meaningful direction (rather than random), so consecutive
@@ -122,17 +132,22 @@ class SimpleRimStrategy:
         moving rim is led rather than aimed-at. Falls back to the live
         rim when prediction isn't available."""
         if ball is None or rim is None:
-            return False
+            return self._waiting(
+                f"no detection (ball={ball is not None}, rim={rim is not None})"
+            )
         if not self.makes:
-            return False
-        if time.perf_counter() - self.last_throw_at < self.COOLDOWN_S:
-            return False
+            return self._waiting("no makes loaded")
+        cooldown_remaining = self.COOLDOWN_S - (
+            time.perf_counter() - self.last_throw_at
+        )
+        if cooldown_remaining > 0:
+            return self._waiting(f"cooldown ({cooldown_remaining:.1f}s left)")
 
         # Update stroke history first so this frame's ball is in the window.
         self._ball_y_history.append(ball.center[1])
         live_stroke = self._stroke()
         if live_stroke is None:
-            return False  # not enough motion yet — can't classify safely
+            return self._waiting("stroke not yet classified (need more motion)")
 
         # Filter to makes whose stroke matches (or whose stroke is unknown,
         # which we keep as a wildcard so legacy log entries still count).
@@ -141,7 +156,10 @@ class SimpleRimStrategy:
             if m.stroke is None or m.stroke == live_stroke
         ]
         if not candidates:
-            return False
+            # No stroke-matching makes — better a worse-aimed shot than a
+            # silent freeze. Fall back to every make and let nearest-rim +
+            # exploration sort it out.
+            candidates = list(self.makes)
 
         # Lead the rim if motion data is available — the ball takes ~1.5 s
         # to reach the rim, so we should match against where the rim will
@@ -166,14 +184,16 @@ class SimpleRimStrategy:
         target_dy = nearest.dy
         # Directed correction takes precedence — if recent throws under-
         # or over-shot, shift the target *that direction* progressively
-        # rather than wandering randomly.
+        # (capped so it can't walk outside the ball's swing range).
         if self._undershoot_streak > 0:
-            target_dy -= (
-                self.DIRECTIONAL_CORRECTION_STEP_PX * self._undershoot_streak
+            target_dy -= min(
+                self.DIRECTIONAL_CORRECTION_STEP_PX * self._undershoot_streak,
+                self.DIRECTIONAL_CORRECTION_MAX_PX,
             )
         elif self._overshoot_streak > 0:
-            target_dy += (
-                self.DIRECTIONAL_CORRECTION_STEP_PX * self._overshoot_streak
+            target_dy += min(
+                self.DIRECTIONAL_CORRECTION_STEP_PX * self._overshoot_streak,
+                self.DIRECTIONAL_CORRECTION_MAX_PX,
             )
         elif self._misses_since_score > 0:
             # No directional signal yet — fall back to random exploration.
@@ -183,7 +203,13 @@ class SimpleRimStrategy:
             )
         bx, by = ball.center
         cur_dy = by - ry
-        return abs(cur_dy - target_dy) <= self.DY_TOLERANCE_PX
+        delta = abs(cur_dy - target_dy)
+        if delta > self.DY_TOLERANCE_PX:
+            return self._waiting(
+                f"dy match: ball_dy={cur_dy} target={target_dy} "
+                f"(off by {delta}, tol={self.DY_TOLERANCE_PX}, stroke={live_stroke})"
+            )
+        return True
 
     def mark_thrown(self) -> None:
         """Record that we just clicked a throw — gates the cooldown and
@@ -240,6 +266,20 @@ class SimpleRimStrategy:
             # game's first attempt isn't already in exploration mode.
             self._misses_since_score = 0
         self._last_observed_score = score
+
+    def _waiting(self, reason: str) -> bool:
+        """Throttled diagnostic — log why we're not throwing. The first
+        word of `reason` is the canonical key; we log on key change or
+        when 5 s have passed since the last log of the same key. Without
+        canonicalization, time-varying details (cooldown remaining, dy
+        delta) would spam every frame."""
+        key = reason.split(":", 1)[0].split()[0] if reason else ""
+        now = time.perf_counter()
+        if key != self._last_wait_reason or now - self._last_wait_log_at >= 5.0:
+            print(f"[strategy] waiting: {reason}")
+            self._last_wait_log_at = now
+            self._last_wait_reason = key
+        return False
 
     def _stroke(self) -> str | None:
         if len(self._ball_y_history) < 2:
@@ -365,18 +405,18 @@ def classify_outcome(
     if not trajectory:
         return "unknown"
 
-    # Did the ball ever travel beyond the rim's right edge while still above
-    # rim level? If so, it went past the front of the rim into backboard
-    # territory — a backboard rebound that bounces back leftward will then
-    # cross rim_y going down at x < rim_x, masquerading as an undershoot.
-    passed_over_rim = any(
-        (
-            len(pt) >= 2
-            and pt[0] > rim_x + tolerance_px
-            and pt[1] < rim_y
-        )
-        for pt in trajectory
+    # Did the ball ever reach past the rim's center, at any altitude?
+    # The HSV ball tracker tends to lose the ball at apex / backboard
+    # impact (motion blur + color overlap), so post-rebound we often
+    # only have samples *below* rim level — even though the ball
+    # clearly hit the backboard. Using max_x (no y constraint) is more
+    # robust than "above rim" since lateral position is what actually
+    # distinguishes a backboard rebound from a fall-short undershoot.
+    max_x_reached = max(
+        (pt[0] for pt in trajectory if len(pt) >= 2),
+        default=None,
     )
+    passed_over_rim = max_x_reached is not None and max_x_reached > rim_x
 
     # Walk the trajectory looking for the first descent through rim_y.
     descent_x: float | None = None
