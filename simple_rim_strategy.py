@@ -81,6 +81,11 @@ class SimpleRimStrategy:
     # the common front-of-rim under-throw failure mode.
     EXPLORATION_DY_LOW = -60
     EXPLORATION_DY_HIGH = 15
+    # Force-throw timeout — if we've been waiting longer than this since
+    # the last throw, take a blind/best-effort shot rather than freezing
+    # indefinitely. The shot might miss, but a miss generates trajectory
+    # data we can learn from; silence generates nothing.
+    WAIT_TIMEOUT_S = 60.0
     # Directed correction step — when notify_outcome tells us we under- or
     # over-shot, shift the dy target this many pixels per consecutive
     # streak frame in the appropriate direction. Grows with the streak so
@@ -94,7 +99,10 @@ class SimpleRimStrategy:
 
     def __init__(self, throws_log_path: Path | str) -> None:
         self.makes: list[_Make] = self._load(Path(throws_log_path))
-        self.last_throw_at: float = 0.0
+        # Initialize to "now" so the WAIT_TIMEOUT_S countdown starts from
+        # construction, not from the epoch (which would force-throw on the
+        # first frame).
+        self.last_throw_at: float = time.perf_counter()
         self._ball_y_history: deque[int] = deque(maxlen=self.STROKE_HISTORY)
         # Score feedback for adaptive exploration: notify_score(...) tracks
         # whether throws are scoring; if not, should_throw() picks a
@@ -135,8 +143,6 @@ class SimpleRimStrategy:
             return self._waiting(
                 f"no detection (ball={ball is not None}, rim={rim is not None})"
             )
-        if not self.makes:
-            return self._waiting("no makes loaded")
         cooldown_remaining = self.COOLDOWN_S - (
             time.perf_counter() - self.last_throw_at
         )
@@ -145,6 +151,22 @@ class SimpleRimStrategy:
 
         # Update stroke history first so this frame's ball is in the window.
         self._ball_y_history.append(ball.center[1])
+
+        # Force-throw guard: if we've waited too long since the last shot,
+        # just throw — better a blind guess that generates trajectory data
+        # to learn from than 10 minutes of silence. Cooldown above means
+        # this only fires once we're past the post-throw quiet period.
+        waited_s = time.perf_counter() - self.last_throw_at
+        if waited_s >= self.WAIT_TIMEOUT_S:
+            print(
+                f"[strategy] FORCING throw — waited {waited_s:.0f}s "
+                f"(>= {self.WAIT_TIMEOUT_S:.0f}s timeout)"
+            )
+            return True
+
+        if not self.makes:
+            return self._waiting("no makes loaded")
+
         live_stroke = self._stroke()
         if live_stroke is None:
             return self._waiting("stroke not yet classified (need more motion)")
