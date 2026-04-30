@@ -228,23 +228,35 @@ class SimpleRimStrategy:
         idx = self._misses_since_score % len(candidates_sorted)
         nearest = candidates_sorted[idx]
         # If the predicted rim is far from this make's rim, the make's
-        # release pattern is irrelevant for *this* rim position. The
-        # right response depends on whether the rim is moving:
-        #   moving rim    → wait for it to oscillate to a known position
-        #   stationary    → it won't move; throw the best-imperfect match
-        #                   and let directional-correction iterate
+        # release pattern is irrelevant for *this* rim position. Decide
+        # whether to wait based on whether the rim has been near the
+        # make in recent history — i.e. is it cycling there at all?
+        # If yes, wait for the next pass. If no, the rim isn't going to
+        # randomly drift over; proceed with the best-imperfect match
+        # and let directional-correction iterate the release.
         rim_to_make_dist = (
             (nearest.rim_x - rx) ** 2 + (nearest.rim_y - ry) ** 2
         ) ** 0.5
         if rim_to_make_dist > self.MAX_PREDICTED_RIM_DIST_PX:
-            if rim_motion is not None and rim_motion.is_moving():
+            min_dist_to_make = (
+                rim_motion.min_distance_to(nearest.rim_x, nearest.rim_y)
+                if rim_motion is not None
+                else None
+            )
+            rim_passes_near_make = (
+                min_dist_to_make is not None
+                and min_dist_to_make <= self.MAX_PREDICTED_RIM_DIST_PX
+            )
+            if rim_passes_near_make:
                 return self._waiting(
                     f"predicted rim ({rx}, {ry}) is {rim_to_make_dist:.0f}px "
-                    f"from nearest make ({nearest.rim_x}, {nearest.rim_y}) — "
-                    f"waiting for rim to oscillate closer"
+                    f"from make ({nearest.rim_x}, {nearest.rim_y}); rim has "
+                    f"been within {min_dist_to_make:.0f}px in recent history "
+                    f"— waiting for next pass"
                 )
-            # Stationary (or motion unknown) — proceed with best-imperfect
-            # match. Throttled log so we don't flood the console.
+            # Rim hasn't been near this make recently — it's either
+            # stationary far away or oscillating in a different region.
+            # Take the best-imperfect shot rather than wait forever.
             self._log_imperfect_match(rim_to_make_dist, nearest)
         target_dy = nearest.dy
         # Directed correction takes precedence — if recent throws under-

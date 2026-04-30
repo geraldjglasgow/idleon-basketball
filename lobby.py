@@ -37,7 +37,7 @@ _ASSETS = Path(__file__).parent / "assets"
 # threshold works for both.
 _MATCH_THRESHOLD = 0.6
 _CONSUME_WAIT_S = 3.0
-_INVENTORY_OPEN_DELAY_S = 0.45
+_INVENTORY_OPEN_DELAY_S = 1.0
 _COOLDOWN_S = 120  # if consume fails (basketball still visible), wait this long
 # Cooldown timer OCR sanity bounds + voting. Real cooldown is at most ~600s,
 # so anything beyond 999 is a misread (e.g. Tesseract appending a phantom

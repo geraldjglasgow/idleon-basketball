@@ -97,6 +97,19 @@ class RimMotionTracker:
             or max_y - min_y > self.MOTION_THRESHOLD_PX
         )
 
+    def min_distance_to(self, target_x: int, target_y: int) -> float | None:
+        """Smallest Euclidean distance from any past rim observation to
+        the target point. Used to ask "has the rim ever cycled close to
+        this position?" — a more direct test than is_moving for
+        deciding whether to wait for an oscillation that may never come.
+        Returns None if history is empty."""
+        if not self._history:
+            return None
+        return min(
+            ((x - target_x) ** 2 + (y - target_y) ** 2) ** 0.5
+            for _, x, y in self._history
+        )
+
 
 def positions_indicate_motion(
     positions, threshold_px: int = RimMotionTracker.MOTION_THRESHOLD_PX
