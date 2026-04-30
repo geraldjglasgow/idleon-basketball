@@ -33,6 +33,7 @@ import numpy as np
 from pynput import mouse
 
 from basketball_tracker import BasketballSample
+from rim_motion_tracker import positions_indicate_motion
 from rim_tracker import RimSample
 from score_reader import ScoreReader
 from screen_capture import Region
@@ -127,6 +128,7 @@ class ThrowRecorder:
         score_region: Region,
         capture_region: Region,
         on_finalize=None,
+        on_drop=None,
     ) -> None:
         self.log_path = Path(log_path)
         self.score_reader = score_reader
@@ -137,6 +139,12 @@ class ThrowRecorder:
         # and feed it back to the strategy without coupling recorder
         # internals to the strategy.
         self._on_finalize = on_finalize
+        # Optional callback `on_drop()` invoked when a throw is dropped
+        # because the score never resolved after MAX_SCORE_ATTEMPTS.
+        # Game.py uses this to detect "stuck reading score that doesn't
+        # exist" — i.e. the bot is in lobby/menu state but doesn't know
+        # — and force a lobby recovery.
+        self._on_drop = on_drop
         self._listener = _ClickListener(zone)
         self._pending: list[_PendingThrow] = []
         # Sliding window of recent ball y positions for stroke detection.
@@ -237,6 +245,7 @@ class ThrowRecorder:
                 # increase means we scored.
                 prev = self._last_score if self._last_score is not None else 0
                 scored = score > prev
+                rim_moving = positions_indicate_motion(p.rim_trajectory)
                 record = {
                     "game_id": self._game_id,
                     "ts": p.ts,
@@ -245,6 +254,7 @@ class ThrowRecorder:
                     "rim_x": p.rim_x,
                     "rim_y": p.rim_y,
                     "stroke": p.stroke,
+                    "rim_moving": rim_moving,
                     "score": score,
                     "scored": scored,
                     "trajectory": [list(pt) for pt in p.trajectory],
@@ -283,6 +293,11 @@ class ThrowRecorder:
                     f"attempts (ball=({p.ball_x}, {p.ball_y}) "
                     f"rim=({p.rim_x}, {p.rim_y}))"
                 )
+                if self._on_drop is not None:
+                    try:
+                        self._on_drop()
+                    except Exception as exc:
+                        print(f"recorder: on_drop callback failed: {exc}")
         self._pending = still_pending
 
     def _read_score_consensus(self) -> int | None:

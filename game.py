@@ -27,6 +27,10 @@ from utils.mouse import click
 
 SCORE_READ_INTERVAL_S = 1.0  # OCR is slow (~30-80 ms); throttle in the loop
 THROWS_LOG_PATH = Path(__file__).parent / "throws.jsonl"
+# If this many throws in a row get dropped (score never resolved), the
+# bot is almost certainly not actually in a game — the score region
+# isn't displaying a number to read. Force a lobby pass to recover.
+MAX_CONSECUTIVE_DROPS = 3
 
 
 def _basketball_overlay(sample: BasketballSample, frame_origin: Region) -> LabeledBox:
@@ -91,8 +95,14 @@ def run(
     game_over_region = GAME_OVER_REGION._asdict()
     strategy = SimpleRimStrategy(THROWS_LOG_PATH)
     rim_motion = RimMotionTracker()
+    # Counter for consecutive dropped throws. Reset on any successful
+    # finalize. When it crosses MAX_CONSECUTIVE_DROPS, the loop forces
+    # a lobby recovery on the next iteration.
+    consecutive_drops = [0]
+    needs_lobby_recovery = [False]
 
     def _on_throw_finalized(record: dict) -> None:
+        consecutive_drops[0] = 0
         rx = record.get("rim_x")
         ry = record.get("rim_y")
         traj = record.get("trajectory") or []
@@ -104,6 +114,15 @@ def run(
         strategy.notify_outcome(outcome)
         print(f"[strategy] throw outcome: {outcome}")
 
+    def _on_throw_dropped() -> None:
+        consecutive_drops[0] += 1
+        print(
+            f"[game] throw drop #{consecutive_drops[0]} of "
+            f"{MAX_CONSECUTIVE_DROPS} consecutive"
+        )
+        if consecutive_drops[0] >= MAX_CONSECUTIVE_DROPS:
+            needs_lobby_recovery[0] = True
+
     recorder = ThrowRecorder(
         log_path=THROWS_LOG_PATH,
         zone=throw_zone,
@@ -111,6 +130,7 @@ def run(
         score_region=score_region,
         capture_region=capture_region,
         on_finalize=_on_throw_finalized,
+        on_drop=_on_throw_dropped,
     )
     recorder.start()
 
@@ -136,6 +156,20 @@ def run(
                     )
                     recorder.reset_score_state()
                     lobby.start_game(preview=preview)
+                    consecutive_drops[0] = 0
+                    needs_lobby_recovery[0] = False
+                    continue
+
+                if needs_lobby_recovery[0]:
+                    print(
+                        f"[game] {consecutive_drops[0]} throws in a row dropped "
+                        f"(score never resolved) — bot likely not in a game; "
+                        f"running lobby recovery"
+                    )
+                    recorder.reset_score_state()
+                    lobby.start_game(preview=preview)
+                    consecutive_drops[0] = 0
+                    needs_lobby_recovery[0] = False
                     continue
 
                 auto_enabled = (

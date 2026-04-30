@@ -37,6 +37,7 @@ from datetime import datetime
 from pathlib import Path
 
 from basketball_tracker import BasketballSample
+from rim_motion_tracker import positions_indicate_motion
 from rim_tracker import RimSample
 
 
@@ -46,8 +47,11 @@ class _Make:
 
     rim_x: int
     rim_y: int
-    dy: int            # ball_y - rim_y at click time
-    stroke: str | None  # "up" / "down" / None (legacy makes with no info)
+    dy: int               # ball_y - rim_y at click time
+    stroke: str | None    # "up" / "down" / None (legacy makes with no info)
+    rim_moving: bool | None  # True if rim was moving during this throw,
+                             # False if stationary, None for legacy logs
+                             # without enough rim_trajectory data
 
 
 # Two consecutive throws further apart than this are treated as different
@@ -61,6 +65,12 @@ class SimpleRimStrategy:
     # Roughly matches the recorder's SCORE_DELAY_S so the previous throw's
     # score has time to update before plausibility filtering runs.
     COOLDOWN_S = 4.0
+    # Wait for the predicted rim to be near a position we have a make for.
+    # If the rim is moving (oscillating), letting it cycle into a known-
+    # good position rather than throwing at extrapolated coordinates we
+    # have no data for. The WAIT_TIMEOUT_S force-throw still bails us
+    # out if the rim never reaches a known position.
+    MAX_PREDICTED_RIM_DIST_PX = 80
     # Live ball-y window for stroke detection (must match recorder's
     # heuristic so on-screen click decisions agree with what gets logged).
     STROKE_HISTORY = 5
@@ -173,15 +183,29 @@ class SimpleRimStrategy:
 
         # Filter to makes whose stroke matches (or whose stroke is unknown,
         # which we keep as a wildcard so legacy log entries still count).
-        candidates = [
+        stroke_matched = [
             m for m in self.makes
             if m.stroke is None or m.stroke == live_stroke
         ]
-        if not candidates:
+        if not stroke_matched:
             # No stroke-matching makes — better a worse-aimed shot than a
             # silent freeze. Fall back to every make and let nearest-rim +
             # exploration sort it out.
-            candidates = list(self.makes)
+            stroke_matched = list(self.makes)
+
+        # Further filter by rim-motion context: makes recorded on a
+        # stationary rim only inform stationary-rim throws (and vice
+        # versa). None-valued (legacy/unknown) acts as a wildcard. If the
+        # filter empties, fall back to stroke_matched so we don't freeze.
+        if rim_motion is not None:
+            live_moving = rim_motion.is_moving()
+            motion_matched = [
+                m for m in stroke_matched
+                if m.rim_moving is None or m.rim_moving == live_moving
+            ]
+            candidates = motion_matched if motion_matched else stroke_matched
+        else:
+            candidates = stroke_matched
 
         # Lead the rim if motion data is available — the ball takes ~1.5 s
         # to reach the rim, so we should match against where the rim will
@@ -203,6 +227,25 @@ class SimpleRimStrategy:
         )
         idx = self._misses_since_score % len(candidates_sorted)
         nearest = candidates_sorted[idx]
+        # If the predicted rim is far from this make's rim, the make's
+        # release pattern is irrelevant for *this* rim position. The
+        # right response depends on whether the rim is moving:
+        #   moving rim    → wait for it to oscillate to a known position
+        #   stationary    → it won't move; throw the best-imperfect match
+        #                   and let directional-correction iterate
+        rim_to_make_dist = (
+            (nearest.rim_x - rx) ** 2 + (nearest.rim_y - ry) ** 2
+        ) ** 0.5
+        if rim_to_make_dist > self.MAX_PREDICTED_RIM_DIST_PX:
+            if rim_motion is not None and rim_motion.is_moving():
+                return self._waiting(
+                    f"predicted rim ({rx}, {ry}) is {rim_to_make_dist:.0f}px "
+                    f"from nearest make ({nearest.rim_x}, {nearest.rim_y}) — "
+                    f"waiting for rim to oscillate closer"
+                )
+            # Stationary (or motion unknown) — proceed with best-imperfect
+            # match. Throttled log so we don't flood the console.
+            self._log_imperfect_match(rim_to_make_dist, nearest)
         target_dy = nearest.dy
         # Directed correction takes precedence — if recent throws under-
         # or over-shot, shift the target *that direction* progressively
@@ -289,6 +332,20 @@ class SimpleRimStrategy:
             self._misses_since_score = 0
         self._last_observed_score = score
 
+    def _log_imperfect_match(self, dist: float, make: _Make) -> None:
+        """One-line log when we proceed without a near-match. Throttled
+        like _waiting so the console isn't flooded by it once per frame
+        while a stationary rim sits near no make."""
+        now = time.perf_counter()
+        if now - self._last_wait_log_at >= 5.0 or self._last_wait_reason != "imperfect":
+            print(
+                f"[strategy] no near match — rim is {dist:.0f}px from "
+                f"closest make ({make.rim_x}, {make.rim_y}); proceeding "
+                f"with best-effort release"
+            )
+            self._last_wait_log_at = now
+            self._last_wait_reason = "imperfect"
+
     def _waiting(self, reason: str) -> bool:
         """Throttled diagnostic — log why we're not throwing. The first
         word of `reason` is the canonical key; we log on key change or
@@ -339,6 +396,15 @@ class SimpleRimStrategy:
             score = r.get("score")
             scored_explicit = r.get("scored")
             stroke = r.get("stroke")  # may be missing on legacy entries
+            # Use the recorded rim_moving when present; otherwise derive
+            # it from rim_trajectory if we have enough samples; else None
+            # so the strategy treats this make as a wildcard for either
+            # motion context.
+            rim_moving = r.get("rim_moving")
+            if rim_moving is None:
+                rim_traj = r.get("rim_trajectory") or []
+                if len(rim_traj) >= 2:
+                    rim_moving = positions_indicate_motion(rim_traj)
             ts = _parse_ts(r.get("ts"))
 
             if prev_ts is not None and ts is not None:
@@ -389,6 +455,9 @@ class SimpleRimStrategy:
                     rim_y=rim_y,
                     dy=ball_y - rim_y,
                     stroke=stroke if stroke in ("up", "down") else None,
+                    rim_moving=(
+                        rim_moving if isinstance(rim_moving, bool) else None
+                    ),
                 ))
 
             if score is not None:

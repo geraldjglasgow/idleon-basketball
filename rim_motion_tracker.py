@@ -29,6 +29,10 @@ from rim_tracker import RimSample
 
 class RimMotionTracker:
     HISTORY_WINDOW_S = 2.0  # how far back the velocity estimate looks
+    # The rim is considered "moving" when its observed bounding-box span
+    # over the history window exceeds this many pixels in either axis.
+    # Smaller than this is treated as tracker jitter on a stationary rim.
+    MOTION_THRESHOLD_PX = 10
 
     def __init__(self) -> None:
         # Each entry is (perf_counter_t, x, y).
@@ -79,3 +83,33 @@ class RimMotionTracker:
         xs = [x for _, x, _ in self._history]
         ys = [y for _, _, y in self._history]
         return (min(xs), min(ys), max(xs), max(ys))
+
+    def is_moving(self) -> bool:
+        """True if the rim's positions over the history window span more
+        than MOTION_THRESHOLD_PX in either axis. Returns False when too
+        few samples (treated as stationary by default)."""
+        b = self.bounds()
+        if b is None or len(self._history) < 2:
+            return False
+        min_x, min_y, max_x, max_y = b
+        return (
+            max_x - min_x > self.MOTION_THRESHOLD_PX
+            or max_y - min_y > self.MOTION_THRESHOLD_PX
+        )
+
+
+def positions_indicate_motion(
+    positions, threshold_px: int = RimMotionTracker.MOTION_THRESHOLD_PX
+) -> bool:
+    """True if the (x, y) tuples span more than `threshold_px` in either
+    axis. Used by the recorder to label a finalized throw's rim_trajectory
+    as moving / stationary, with the same threshold the live tracker uses."""
+    coords = [(p[0], p[1]) for p in positions if len(p) >= 2]
+    if len(coords) < 2:
+        return False
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return (
+        max(xs) - min(xs) > threshold_px
+        or max(ys) - min(ys) > threshold_px
+    )
