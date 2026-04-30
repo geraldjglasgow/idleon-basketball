@@ -44,7 +44,12 @@ _COOLDOWN_S = 120  # if consume fails (basketball still visible), wait this long
 # 4th digit, like reading "293" as "2933"). 0 is also nonsense — that means
 # no cooldown but the consume failed somehow.
 _COOLDOWN_MAX_S = 999
-_COOLDOWN_VOTE_SAMPLES = 3
+# Take 5 samples and vote — more chances to outvote a single OCR glitch
+# like a dropped leading digit. A common failure mode is "843" being read
+# as "43"; with majority voting we resist that as long as most reads are
+# correct, AND length-filtering below biases toward the more-confident
+# reading when length disagrees.
+_COOLDOWN_VOTE_SAMPLES = 5
 _COOLDOWN_VOTE_INTERVAL_S = 0.05
 
 
@@ -65,10 +70,16 @@ _NUMBER_READER = ScoreReader()
 
 def _read_cooldown_timer() -> int | None:
     """Capture COOLDOWN_TIMER_REGION several times and OCR each. Returns
-    the mode of plausible readings (0 < value <= _COOLDOWN_MAX_S), or None
-    if no plausible reading was seen. Multi-sample voting + an upper-bound
-    cap protect against transient OCR misreads — most importantly the
-    "293 → 2933" hallucinated-extra-digit failure mode."""
+    the mode of plausible readings, or None if no plausible reading was
+    seen.
+
+    Multi-sample voting + an upper-bound cap (999) protect against:
+      - "293 -> 2933" hallucinated extra digit (rejected by upper cap)
+      - "843 -> 43" dropped leading digit (handled by length-filter:
+        when sample digit-counts disagree, only the longest survive
+        before mode voting, on the assumption that an OCR misread is
+        far more likely to drop a digit than to invent one)
+    """
     region_dict = COOLDOWN_TIMER_REGION._asdict()
     samples: list[int] = []
     with mss.MSS() as sct:
@@ -82,6 +93,12 @@ def _read_cooldown_timer() -> int | None:
                 time.sleep(_COOLDOWN_VOTE_INTERVAL_S)
     if not samples:
         return None
+    # Length-filter: cooldowns count down, so within a 250 ms sampling
+    # window all *correct* reads should have the same digit count. If
+    # one sample reads 2 digits and the others read 3, the short read
+    # is almost certainly a dropped-leading-digit misread.
+    longest = max(len(str(v)) for v in samples)
+    samples = [v for v in samples if len(str(v)) == longest]
     return Counter(samples).most_common(1)[0][0]
 
 
