@@ -180,11 +180,20 @@ class ScoreReader:
 
     def _extract_digit_components(self, mask: np.ndarray) -> list[np.ndarray]:
         """Find connected components, sort left-to-right, normalize each
-        to DIGIT_NORM_HEIGHT preserving aspect."""
+        to DIGIT_NORM_HEIGHT preserving aspect.
+
+        Drops outlier components whose height is wildly different from
+        the others — a phantom UI artifact (e.g. a 1-shaped sliver from
+        a neighboring icon edge) creeping into the score region was the
+        root cause of "2 read as 12" misreads. We use the *max* height
+        as the reference because real digits in this font are uniform
+        height, and any short-by-half component is almost certainly
+        not a digit.
+        """
         n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
             mask, connectivity=8
         )
-        comps: list[tuple[int, np.ndarray]] = []
+        raw: list[tuple[int, int, int, np.ndarray]] = []  # (x, w, h, crop)
         for i in range(1, n_labels):
             x = int(stats[i, cv2.CC_STAT_LEFT])
             y = int(stats[i, cv2.CC_STAT_TOP])
@@ -193,7 +202,16 @@ class ScoreReader:
             area = int(stats[i, cv2.CC_STAT_AREA])
             if area < self.MIN_COMPONENT_AREA or w == 0 or h == 0:
                 continue
-            crop = mask[y:y + h, x:x + w]
+            raw.append((x, w, h, mask[y:y + h, x:x + w]))
+        if not raw:
+            return []
+        # Filter by height: anything shorter than half the tallest
+        # component is treated as an artifact, not a digit.
+        max_h = max(item[2] for item in raw)
+        height_threshold = max_h * 0.5
+        filtered = [item for item in raw if item[2] >= height_threshold]
+        comps: list[tuple[int, np.ndarray]] = []
+        for x, w, h, crop in filtered:
             scale = self.DIGIT_NORM_HEIGHT / h
             new_w = max(1, int(round(w * scale)))
             normalized = cv2.resize(

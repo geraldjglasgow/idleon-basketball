@@ -20,7 +20,7 @@ from rim_motion_tracker import RimMotionTracker
 from rim_tracker import RimSample, RimTracker
 from score_reader import ScoreReader
 from screen_capture import Region, ScreenCapture, primary_monitor_region
-from simple_rim_strategy import SimpleRimStrategy, classify_outcome
+from strategies import STRATEGIES, build_strategy, classify_outcome
 from throw_handler import ThrowRecorder
 from utils.mouse import click
 
@@ -79,13 +79,16 @@ PREVIEW_MODES = ("off", "full", "light")
 def run(
     preview: PreviewWindow | None = None,
     hotkey_listener=None,
+    strategy_name: str = "oscillation",
 ) -> None:
     """Run the in-game loop (capture + trackers + score reader + throw
     recorder). `preview` is an optional pre-constructed window — pass None
     for headless. `hotkey_listener` gates the strategy's auto-throwing —
     if None, the strategy runs unconditionally (useful for direct game.py
     invocation); if provided, only fires while `listener.auto_enabled` is
-    True (toggled with F1/F2). Assumes the game has already been started."""
+    True (toggled with F1/F2). `strategy_name` selects the throw-decision
+    strategy (see `strategies` package). Assumes the game has already
+    been started."""
     capture_region = primary_monitor_region()
     basketball_tracker = BasketballTracker()
     rim_tracker = RimTracker()
@@ -93,8 +96,13 @@ def run(
     score_region = SCORE_REGION._asdict()
     throw_zone = THROW_ZONE._asdict()
     game_over_region = GAME_OVER_REGION._asdict()
-    strategy = SimpleRimStrategy(THROWS_LOG_PATH)
-    rim_motion = RimMotionTracker()
+    strategy = build_strategy(strategy_name, THROWS_LOG_PATH)
+    # The motion tracker's history window depends on the strategy — the
+    # oscillation strategy needs ~12 s to fit a period, while the simple
+    # strategy is happy with the default 2 s.
+    rim_motion = RimMotionTracker(
+        history_window_s=strategy.REQUIRED_HISTORY_WINDOW_S
+    )
     # Counter for consecutive dropped throws. Reset on any successful
     # finalize. When it crosses MAX_CONSECUTIVE_DROPS, the loop forces
     # a lobby recovery on the next iteration.
@@ -150,11 +158,24 @@ def run(
                 if is_game_over(frame, game_over_region, capture_region):
                     print("[game] game over screen detected — waiting 2s, clicking exit")
                     time.sleep(2.0)
+                    # Finalize any in-flight throws first — the losing
+                    # throw is the one we most need recorded so the
+                    # strategy can learn from it (notify_outcome) and
+                    # so it's persisted to throws.jsonl for next session.
+                    # Done before clicking exit, while the score region
+                    # is still showing the final score.
+                    if recorder.has_pending():
+                        print(
+                            f"[game] {recorder.pending_count()} throw(s) "
+                            f"still pending — flushing before reset"
+                        )
+                        recorder.flush_pending()
                     click(
                         EXIT_BUTTON_REGION.left + EXIT_BUTTON_REGION.width // 2,
                         EXIT_BUTTON_REGION.top + EXIT_BUTTON_REGION.height // 2,
                     )
                     recorder.reset_score_state()
+                    strategy.notify_game_reset()
                     lobby.start_game(preview=preview)
                     consecutive_drops[0] = 0
                     needs_lobby_recovery[0] = False
@@ -167,6 +188,7 @@ def run(
                         f"running lobby recovery"
                     )
                     recorder.reset_score_state()
+                    strategy.notify_game_reset()
                     lobby.start_game(preview=preview)
                     consecutive_drops[0] = 0
                     needs_lobby_recovery[0] = False
@@ -228,6 +250,15 @@ def _parse_args() -> argparse.Namespace:
         default="off",
         help="off = no window; full = stream + overlays; light = debug text only",
     )
+    parser.add_argument(
+        "--strategy",
+        choices=sorted(STRATEGIES),
+        default="oscillation",
+        help=(
+            "throw-decision strategy. simple = stationary-rim heuristics; "
+            "oscillation = phase-aware moving-rim (uses simple for score<10)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -238,7 +269,7 @@ def main() -> None:
         else PreviewWindow(lightweight=(args.preview == "light"))
     )
     try:
-        run(preview=preview)
+        run(preview=preview, strategy_name=args.strategy)
     finally:
         if preview is not None:
             preview.close()

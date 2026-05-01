@@ -37,6 +37,7 @@ from rim_motion_tracker import positions_indicate_motion
 from rim_tracker import RimSample
 from score_reader import ScoreReader
 from screen_capture import Region
+from strategies.shared import MOVING_RIM_MIN_SCORE
 
 
 def _new_game_id() -> str:
@@ -106,10 +107,24 @@ class _ClickListener:
 class ThrowRecorder:
     SCORE_DELAY_S = 3.0
     SCORE_RETRY_DELAY_S = 1.0
-    MAX_SCORE_ATTEMPTS = 10
+    # ~20 s total retry budget (MAX_SCORE_ATTEMPTS * SCORE_RETRY_DELAY_S
+    # plus the initial SCORE_DELAY_S). Some sessions need this — e.g.
+    # when consecutive made throws push the score up by more than the
+    # narrow plausibility window expects, or when an earlier throw was
+    # dropped and the new read is "implausibly" far from _last_score.
+    MAX_SCORE_ATTEMPTS = 20
     # Per attempt: take this many fresh OCR samples and vote.
     SCORE_VOTE_SAMPLES = 5
     SCORE_VOTE_INTERVAL_S = 0.1
+    # Plausibility filter for OCR samples: a candidate score is accepted
+    # if it's between last_score and last_score + this many. Was 2 (only
+    # +0/+1/+2 allowed); raised because (a) some games award 3 points,
+    # (b) a previously-dropped throw means the new read could legitimately
+    # be last+3 or last+4, and (c) OCR misreads of a really-too-large
+    # value (like "78") are still rejected — we just don't reject correct
+    # readings of "11" when last was "8" because a throw or two got
+    # dropped in between.
+    SCORE_MAX_INCREASE = 5
     # Collect ball + rim positions for this long after the click. Set just
     # under SCORE_DELAY_S so trajectory capture finishes before the score
     # read kicks in, and long enough that the ball reaches the rim level
@@ -164,11 +179,59 @@ class ThrowRecorder:
     def stop(self) -> None:
         self._listener.stop()
 
+    def has_pending(self) -> bool:
+        """True if any throw is still waiting on a score read. Lets the
+        game loop hold off the post-game-over reset until the final
+        throw has finalized (so a losing throw still gets recorded)."""
+        return bool(self._pending)
+
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def flush_pending(self, timeout_s: float = 30.0) -> int:
+        """Drive finalize/retry on every pending throw until they all
+        resolve or `timeout_s` elapses. Returns the number of throws
+        that were successfully logged (vs dropped on timeout).
+
+        Used at game-over to make sure the losing throw is recorded
+        before we reset state — without this, the final throw is
+        invisible to the strategy (no notify_outcome) and absent from
+        throws.jsonl, so future sessions can't learn from it.
+
+        Finalize-only: does NOT consume new clicks or sample
+        trajectories (those windows have closed by game-over anyway).
+        Retries fire immediately rather than respecting the original
+        SCORE_RETRY_DELAY_S — we want the score on screen NOW, not in
+        20 seconds.
+        """
+        if not self._pending:
+            return 0
+        n_at_start = len(self._pending)
+        print(f"recorder: flushing {n_at_start} pending throw(s) before reset")
+        deadline = time.perf_counter() + timeout_s
+        while self._pending and time.perf_counter() < deadline:
+            self._finalize_pending(now=time.perf_counter(), retry_delay_s=0.0)
+            if self._pending:
+                # Brief pause so OCR has fresh frames between attempts
+                # (the score voter itself spaces internal samples already,
+                # but back-to-back consensus calls without any wait are
+                # wasted reads against the same frame).
+                time.sleep(self.SCORE_RETRY_DELAY_S)
+        if self._pending:
+            print(
+                f"recorder: flush timed out with {len(self._pending)} "
+                f"throw(s) still pending after {timeout_s:.0f}s — dropping"
+            )
+        return n_at_start - len(self._pending)
+
     def reset_score_state(self) -> None:
         """Drop any pending throws, forget the last score, and rotate the
         game_id. Call this when the game restarts (new game starts at 0,
         so the prior session's last score would reject every plausible
-        reading; subsequent throws need a fresh game_id too)."""
+        reading; subsequent throws need a fresh game_id too).
+
+        Prefer `flush_pending()` first if the goal is to preserve the
+        final throw's record (e.g. on game-over)."""
         if self._pending:
             print(
                 f"recorder: dropping {len(self._pending)} pending throw(s) "
@@ -232,6 +295,15 @@ class ThrowRecorder:
             if rim is not None:
                 rx, ry = rim.center
                 p.rim_trajectory.append((rx, ry, dt_ms))
+        self._finalize_pending(now=now, retry_delay_s=self.SCORE_RETRY_DELAY_S)
+
+    def _finalize_pending(self, now: float, retry_delay_s: float) -> None:
+        """For each pending throw whose finalize timer has elapsed, run
+        a score-consensus read; either log + invoke callbacks, requeue
+        with the given retry delay, or drop after MAX_SCORE_ATTEMPTS.
+
+        `retry_delay_s=0` makes retries fire on the next call — used by
+        flush_pending() at game-over."""
         still_pending: list[_PendingThrow] = []
         for p in self._pending:
             if now < p.finalize_at:
@@ -245,7 +317,16 @@ class ThrowRecorder:
                 # increase means we scored.
                 prev = self._last_score if self._last_score is not None else 0
                 scored = score > prev
-                rim_moving = positions_indicate_motion(p.rim_trajectory)
+                # The score *at click time* was `prev`. The rim is provably
+                # stationary below MOVING_RIM_MIN_SCORE, so any "moving"
+                # reading there is tracker jitter and should be recorded as
+                # False — otherwise we re-pollute the make set with bogus
+                # moving-rim entries every game (the same misclassification
+                # the one-shot fixer in tools/ corrected on legacy data).
+                if prev < MOVING_RIM_MIN_SCORE:
+                    rim_moving = False
+                else:
+                    rim_moving = positions_indicate_motion(p.rim_trajectory)
                 record = {
                     "game_id": self._game_id,
                     "ts": p.ts,
@@ -278,14 +359,14 @@ class ThrowRecorder:
                 still_pending.append(
                     replace(
                         p,
-                        finalize_at=now + self.SCORE_RETRY_DELAY_S,
+                        finalize_at=now + retry_delay_s,
                         attempts=attempts,
                     )
                 )
                 print(
                     f"score read inconclusive "
                     f"({attempts}/{self.MAX_SCORE_ATTEMPTS}) — retrying in "
-                    f"{self.SCORE_RETRY_DELAY_S:.1f}s"
+                    f"{retry_delay_s:.1f}s"
                 )
             else:
                 print(
@@ -302,8 +383,9 @@ class ThrowRecorder:
 
     def _read_score_consensus(self) -> int | None:
         """Take SCORE_VOTE_SAMPLES samples; filter to plausible values
-        (last_score..last_score+2, or all if we have no prior score); return
-        the mode of survivors, or None if nothing readable + plausible."""
+        (last_score..last_score+SCORE_MAX_INCREASE, or all if we have no
+        prior score); return the mode of survivors, or None if nothing
+        readable + plausible."""
         samples: list[int] = []
         with mss.MSS() as sct:
             for i in range(self.SCORE_VOTE_SAMPLES):
@@ -320,12 +402,16 @@ class ThrowRecorder:
         if self._last_score is None:
             plausible = samples
         else:
-            lo, hi = self._last_score, self._last_score + 2
+            lo = self._last_score
+            hi = self._last_score + self.SCORE_MAX_INCREASE
             plausible = [s for s in samples if lo <= s <= hi]
 
         if not plausible:
             if samples:
-                print(f"score samples {samples} — none plausible vs last={self._last_score}")
+                print(
+                    f"score samples {samples} — none plausible vs "
+                    f"last={self._last_score} (window {lo if self._last_score is not None else '?'}..{hi if self._last_score is not None else '?'})"
+                )
             return None
         return Counter(plausible).most_common(1)[0][0]
 

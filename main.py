@@ -3,6 +3,7 @@ import argparse
 import game
 from lobby import start_game
 from preview_window import PreviewWindow
+from strategies import STRATEGIES
 
 
 def _parse_args() -> argparse.Namespace:
@@ -17,6 +18,15 @@ def _parse_args() -> argparse.Namespace:
         "--light",
         action="store_true",
         help="open a small debug-text-only window during the game loop",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=sorted(STRATEGIES),
+        default="oscillation",
+        help=(
+            "throw-decision strategy. simple = stationary-rim heuristics; "
+            "oscillation = phase-aware moving-rim (uses simple for score<10)"
+        ),
     )
     return parser.parse_args()
 
@@ -36,7 +46,7 @@ def main() -> None:
         preview = PreviewWindow(lightweight=(preview_mode == "light"))
     try:
         start_game(preview=preview)
-        game.run(preview=preview)
+        game.run(preview=preview, strategy_name=args.strategy)
     except KeyboardInterrupt:
         print("[main] stopped")
     finally:

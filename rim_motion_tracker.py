@@ -28,26 +28,40 @@ from rim_tracker import RimSample
 
 
 class RimMotionTracker:
-    HISTORY_WINDOW_S = 2.0  # how far back the velocity estimate looks
+    DEFAULT_HISTORY_WINDOW_S = 2.0  # default for linear-extrapolation use
     # The rim is considered "moving" when its observed bounding-box span
     # over the history window exceeds this many pixels in either axis.
     # Smaller than this is treated as tracker jitter on a stationary rim.
     MOTION_THRESHOLD_PX = 10
 
-    def __init__(self) -> None:
+    def __init__(self, history_window_s: float | None = None) -> None:
         # Each entry is (perf_counter_t, x, y).
         self._history: deque[tuple[float, int, int]] = deque()
+        # Per-instance window so a strategy that needs a longer view (e.g.
+        # the oscillation strategy fitting a sinusoid) can opt in without
+        # affecting the default linear-extrapolation use case.
+        self.history_window_s: float = (
+            history_window_s
+            if history_window_s is not None
+            else self.DEFAULT_HISTORY_WINDOW_S
+        )
 
     def observe(self, rim: RimSample | None) -> None:
         """Record the current frame's rim position. Pass None if the rim
         wasn't detected this frame (skipped, doesn't reset history)."""
         now = time.perf_counter()
-        cutoff = now - self.HISTORY_WINDOW_S
+        cutoff = now - self.history_window_s
         while self._history and self._history[0][0] < cutoff:
             self._history.popleft()
         if rim is not None:
             x, y = rim.center
             self._history.append((now, x, y))
+
+    def samples(self) -> list[tuple[float, int, int]]:
+        """Snapshot of the current history window — `(t, x, y)` tuples,
+        oldest first. Lets external models (e.g. RimOscillationModel)
+        consume the rim trace without poking at internals."""
+        return list(self._history)
 
     def predict(self, dt_seconds: float) -> tuple[int, int] | None:
         """Linear-extrapolate where the rim will be `dt_seconds` from now.

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python -c \"from strategies.oscillation import OscillationStrategy; from strategies.oscillation_model import RimOscillationModel; print\\('ok'\\)\")",
+      "Bash(venv/Scripts/python -c ' *)"
+    ]
+  }
+}
