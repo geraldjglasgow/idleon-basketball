@@ -27,6 +27,14 @@ class LabeledBox:
 
 class PreviewWindow:
     LIGHTWEIGHT_CANVAS_SIZE = (320, 400)  # (width, height)
+    # Default full-mode window size. The captured frame is 1920×1080 but we
+    # render the window at half-res so it fits comfortably on a 1080p
+    # monitor with room for the title bar / taskbar. cv2.imshow scales
+    # the annotated frame into this size, and our overlay rectangles
+    # (drawn in frame coords) scale with it — at this size they're
+    # clearly visible. Without an explicit resize the window defaults to
+    # something tiny and the boxes shrink to ~1 px.
+    FULL_CANVAS_SIZE = (1280, 720)
 
     def __init__(
         self,
@@ -41,13 +49,20 @@ class PreviewWindow:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         if lightweight:
             w, h = self.LIGHTWEIGHT_CANVAS_SIZE
-            cv2.resizeWindow(self.window_name, w, h)
+        else:
+            w, h = self.FULL_CANVAS_SIZE
+        cv2.resizeWindow(self.window_name, w, h)
 
     def show_status(self, lines: list[str]) -> bool:
-        """Render only a debug box with `lines` onto a small dark canvas —
+        """Render only a debug box with `lines` onto a dark canvas —
         useful when there's no captured frame yet (e.g. during the lobby
-        phase). Same return semantics as `show`."""
-        w, h = self.LIGHTWEIGHT_CANVAS_SIZE
+        phase). Canvas is sized to match the window mode so cv2 doesn't
+        stretch a tiny canvas up to a large window. Same return
+        semantics as `show`."""
+        w, h = (
+            self.LIGHTWEIGHT_CANVAS_SIZE
+            if self.lightweight else self.FULL_CANVAS_SIZE
+        )
         annotated = np.full((h, w, 3), 30, dtype=np.uint8)
         self._draw_debug_box(annotated, lines)
         cv2.imshow(self.window_name, annotated)

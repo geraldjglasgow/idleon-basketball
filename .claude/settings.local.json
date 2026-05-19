@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(venv\\\\Scripts\\\\python.exe -m pip install --upgrade pip)",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -m pip install -r requirements.txt)",
+      "PowerShell(Get-ChildItem -Path 'C:\\\\Program Files','C:\\\\Program Files \\(x86\\)',\"$env:LOCALAPPDATA\",\"$env:APPDATA\",\"$env:USERPROFILE\" -Filter 'tesseract.exe' -Recurse -ErrorAction SilentlyContinue -Depth 4 | Select-Object -First 5 -ExpandProperty FullName)",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from basketball_tracker import BasketballTracker; from regions import THROW_ZONE, ITEM_BASKETBALL, ITEMS_BUTTON; t = BasketballTracker\\(hud_exclusions=\\(tuple\\(THROW_ZONE\\), tuple\\(ITEM_BASKETBALL\\), tuple\\(ITEMS_BUTTON\\)\\)\\); print\\('ok', t._hud_exclusions\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"import numpy as np; from basketball_tracker import BasketballTracker; from regions import THROW_ZONE, ITEM_BASKETBALL, ITEMS_BUTTON; t = BasketballTracker\\(hud_exclusions=\\(tuple\\(THROW_ZONE\\), tuple\\(ITEM_BASKETBALL\\), tuple\\(ITEMS_BUTTON\\)\\)\\); frame = np.zeros\\(\\(1080,1920,3\\), dtype=np.uint8\\); frame[60, 1670] = \\(0, 100, 255\\); origin = {'top':0,'left':0,'width':1920,'height':1080}; print\\('throw-zone pixel ignored:', t.read\\(frame, origin\\) is None\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"import game; print\\('ok'\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from strategies.oscillation import OscillationStrategy; s = OscillationStrategy\\('throws.jsonl'\\); print\\('quarantine threshold:', s.MAX_CONSECUTIVE_FAILURES_PER_MAKE\\); print\\('initial quarantined:', s._quarantined_makes\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from strategies.simple import SimpleRimStrategy; print\\('threshold:', SimpleRimStrategy.MAX_CONSECUTIVE_FAILURES_PER_MAKE\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from strategies.simple import SimpleRimStrategy; from strategies.oscillation import OscillationStrategy; print\\('simple step:', SimpleRimStrategy.DIRECTIONAL_CORRECTION_STEP_PX, 'thresh:', SimpleRimStrategy.MAX_CONSECUTIVE_FAILURES_PER_MAKE\\); print\\('osc step:', OscillationStrategy.DIRECTIONAL_CORRECTION_STEP_PX, 'thresh:', OscillationStrategy.MAX_CONSECUTIVE_FAILURES_PER_MAKE\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from strategies.simple import SimpleRimStrategy; from strategies.oscillation import OscillationStrategy; s1=SimpleRimStrategy\\('throws.jsonl'\\); s2=OscillationStrategy\\('throws.jsonl'\\); print\\('simple last_click_dy:', s1._last_click_dy\\); print\\('oscillation last_click_dy:', s2._last_click_dy\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from strategies.oscillation import OscillationStrategy; s = OscillationStrategy\\('throws.jsonl'\\); print\\('miss index total:', s._misses_index.total\\)\")",
+      "PowerShell(venv\\\\Scripts\\\\python.exe -c \"from strategies.simple import SimpleRimStrategy; from strategies.oscillation import OscillationStrategy; s = SimpleRimStrategy\\('throws.jsonl'\\); print\\('OK', s.misses_index.total\\)\")"
+    ]
+  }
+}

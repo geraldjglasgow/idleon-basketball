@@ -25,13 +25,23 @@ from basketball_tracker import BasketballSample
 from rim_tracker import RimSample
 
 from .base import Strategy
-from .shared import _Make, load_makes, measure_ball_flight_s
+from .shared import (
+    DyModel,
+    MissIndex,
+    _Make,
+    load_makes,
+    load_misses,
+    measure_ball_flight_s,
+)
 
 
 class SimpleRimStrategy(Strategy):
     DY_TOLERANCE_PX = 25
     # Don't issue a second click until this long after the previous one.
-    COOLDOWN_S = 4.0
+    # Dropped from 4.0 to 2.0 — the game settles fast enough that 2 s
+    # is sufficient for the score region to update and the ball to
+    # re-enter the throw zone; 4 s was leaving the bot idle.
+    COOLDOWN_S = 2.0
     # Wait for the predicted rim to be near a position we have a make for.
     MAX_PREDICTED_RIM_DIST_PX = 80
     # Live ball-y window for stroke detection. STROKE_HISTORY/_DELTA must
@@ -63,26 +73,43 @@ class SimpleRimStrategy(Strategy):
     WAIT_TIMEOUT_S = 60.0
     # Directed correction step + cap — when notify_outcome tells us we
     # under- or over-shot, shift dy by step*streak in that direction.
-    # Step raised from 30 -> 50 and cap from 90 -> 200 because real
-    # undershoots in the wild were 200+ px; the old cap couldn't recover.
-    DIRECTIONAL_CORRECTION_STEP_PX = 50
+    # Step raised from 50 -> 80 so a single miss produces a visibly
+    # different next shot instead of needing a multi-miss streak to
+    # accumulate. Cap stays at 200 since real undershoots in the wild
+    # were 200+ px.
+    DIRECTIONAL_CORRECTION_STEP_PX = 80
     DIRECTIONAL_CORRECTION_MAX_PX = 200
 
     # A make gets quarantined for the rest of the session after this
-    # many consecutive non-make outcomes attributed to it. Stops the
-    # nearest-rim picker from getting stuck on a make whose recorded
-    # release no longer reproduces (different in-game release physics,
-    # stale calibration, etc.). On a make the counter resets, so a
-    # genuinely-good make stays usable forever.
-    MAX_CONSECUTIVE_FAILURES_PER_MAKE = 3
+    # many consecutive non-make outcomes attributed to it. Set to 1
+    # because attempting the same shot twice on a stationary rim
+    # reproduces the same miss — a make whose recorded release didn't
+    # work this game won't work next throw either. On a make the
+    # counter resets, so a genuinely-good make stays usable forever.
+    MAX_CONSECUTIVE_FAILURES_PER_MAKE = 1
 
     # The simple strategy is happy with the tracker's default 2 s window —
     # linear extrapolation only needs a couple of seconds of velocity.
     REQUIRED_HISTORY_WINDOW_S: float | None = None
 
+    # When a candidate make's (rim_x, rim_y, dy) bucket has historical
+    # misses, add this many "virtual px" of distance per nearby miss to
+    # the sort key — capped to MISS_PENALTY_CAP_HITS so a position with
+    # an extreme miss count (the data has buckets with 30+ misses)
+    # doesn't catastrophically dominate the sort. With cap=4 and
+    # per-hit=20, max equivalent penalty is 80 px ≈ MAX_PREDICTED_RIM_DIST_PX,
+    # i.e. similar weight to "outside the matchable rim radius."
+    MISS_PENALTY_PX_PER_HIT = 20
+    MISS_PENALTY_CAP_HITS = 4
+
     def __init__(self, throws_log_path: Path | str) -> None:
         path = Path(throws_log_path)
         self.makes: list[_Make] = load_makes(path)
+        self.misses_index = MissIndex(load_misses(path))
+        # Cold-start fallback: when the live rim is too far from any
+        # historical make to trust that make's recorded dy, use this
+        # regression's prediction instead.
+        self.dy_model = DyModel(self.makes)
         # Override class default with empirical measurement when we have
         # enough scored throws to compute a reliable median.
         self.BALL_FLIGHT_S = measure_ball_flight_s(
@@ -106,10 +133,26 @@ class SimpleRimStrategy(Strategy):
         # click. Set by should_throw, consumed by notify_outcome to credit
         # the correct make with the result.
         self._last_used_make: _Make | None = None
+        # The dy the bot actually clicked at on its most recent throw.
+        # When an under/overshoot streak is active, we base the next
+        # correction off this value rather than the rotated make's
+        # recorded dy — otherwise rotating to a make with a very
+        # different recorded dy can cancel or reverse the streak's
+        # intended shift. Cleared on make / game-reset.
+        self._last_click_dy: int | None = None
         with_stroke = sum(1 for m in self.makes if m.stroke is not None)
+        model_status = (
+            f"dy_model fit on {self.dy_model.n_samples} stationary makes"
+            if self.dy_model._coef is not None
+            else f"dy_model disabled ({self.dy_model.n_samples} stationary makes "
+                 f"< {self.dy_model.MIN_FIT_SAMPLES} required)"
+        )
         print(
             f"SimpleRimStrategy: loaded {len(self.makes)} make(s) "
-            f"({with_stroke} with stroke info) from {throws_log_path}; "
+            f"({with_stroke} with stroke info), "
+            f"{self.misses_index.total} miss(es) for negative learning, "
+            f"{model_status} "
+            f"from {throws_log_path}; "
             f"BALL_FLIGHT_S={self.BALL_FLIGHT_S:.2f}s"
         )
 
@@ -185,10 +228,21 @@ class SimpleRimStrategy(Strategy):
             target = rim.center
         rx, ry = target
 
-        candidates_sorted = sorted(
-            candidates,
-            key=lambda m: (m.rim_x - rx) ** 2 + (m.rim_y - ry) ** 2,
-        )
+        # Sort by distance to predicted rim, plus a soft penalty for
+        # candidates whose (rim_x, rim_y, dy) signature has historical
+        # misses nearby — those are positions where a similar shot
+        # didn't drop the ball through the rim before, so prefer makes
+        # in less-historically-failed signatures when available.
+        def candidate_score(m: _Make) -> float:
+            dist_sq = (m.rim_x - rx) ** 2 + (m.rim_y - ry) ** 2
+            misses_near = min(
+                self.misses_index.count_near(m.rim_x, m.rim_y, m.dy),
+                self.MISS_PENALTY_CAP_HITS,
+            )
+            penalty = (misses_near * self.MISS_PENALTY_PX_PER_HIT) ** 2
+            return dist_sq + penalty
+
+        candidates_sorted = sorted(candidates, key=candidate_score)
         idx = self._misses_since_score % len(candidates_sorted)
         nearest = candidates_sorted[idx]
         rim_to_make_dist = (
@@ -213,22 +267,73 @@ class SimpleRimStrategy(Strategy):
                 )
             self._log_imperfect_match(rim_to_make_dist, nearest)
 
-        target_dy = nearest.dy
-        if self._undershoot_streak > 0:
-            target_dy -= min(
-                self.DIRECTIONAL_CORRECTION_STEP_PX * self._undershoot_streak,
+        # When a directional streak is active, base the correction off
+        # our last actual click dy rather than the rotated make's
+        # recorded dy. Rotation can swing the base by hundreds of px,
+        # which an 80 px streak step can't override — the data shows
+        # 32% of post-undershoot attempts end up launching in the wrong
+        # direction because of this. Anchoring to last_click_dy makes
+        # each subsequent shot a monotonic shift from the previous one.
+        if self._undershoot_streak > 0 and self._last_click_dy is not None:
+            target_dy = self._last_click_dy - min(
+                self.DIRECTIONAL_CORRECTION_STEP_PX,
                 self.DIRECTIONAL_CORRECTION_MAX_PX,
             )
-        elif self._overshoot_streak > 0:
-            target_dy += min(
-                self.DIRECTIONAL_CORRECTION_STEP_PX * self._overshoot_streak,
+        elif self._overshoot_streak > 0 and self._last_click_dy is not None:
+            target_dy = self._last_click_dy + min(
+                self.DIRECTIONAL_CORRECTION_STEP_PX,
                 self.DIRECTIONAL_CORRECTION_MAX_PX,
             )
-        elif self._misses_since_score > 0:
-            target_dy += random.randint(
-                self.EXPLORATION_DY_LOW,
-                self.EXPLORATION_DY_HIGH,
-            )
+        else:
+            # Cold-start: no active streak, no prior click to anchor off.
+            # If the nearest historical make is well outside the matchable
+            # rim radius, its recorded dy was calibrated for a different
+            # rim geometry — the regression model's prediction for the
+            # current rim is on average a better starting point. Inside
+            # the matchable radius, the make's own recorded dy wins
+            # (it's a direct observation, not an interpolation).
+            model_dy = None
+            if rim_to_make_dist > self.MAX_PREDICTED_RIM_DIST_PX:
+                model_dy = self.dy_model.predict(rx, ry)
+            if model_dy is not None:
+                target_dy = model_dy
+                print(
+                    f"[strategy] cold-start: nearest make is "
+                    f"{rim_to_make_dist:.0f}px from rim ({rx}, {ry}); "
+                    f"using regression model dy={model_dy} (vs "
+                    f"nearest.dy={nearest.dy})"
+                )
+            else:
+                target_dy = nearest.dy
+            if self._undershoot_streak > 0:
+                target_dy -= min(
+                    self.DIRECTIONAL_CORRECTION_STEP_PX * self._undershoot_streak,
+                    self.DIRECTIONAL_CORRECTION_MAX_PX,
+                )
+            elif self._overshoot_streak > 0:
+                target_dy += min(
+                    self.DIRECTIONAL_CORRECTION_STEP_PX * self._overshoot_streak,
+                    self.DIRECTIONAL_CORRECTION_MAX_PX,
+                )
+            elif self._misses_since_score > 0:
+                target_dy += random.randint(
+                    self.EXPLORATION_DY_LOW,
+                    self.EXPLORATION_DY_HIGH,
+                )
+        # Clamp target_dy to the reachable range. The streak-anchored
+        # walk (last_click_dy ± 80 each miss) is unbounded — if the
+        # ball's bounce in the throw zone caps at ~300 px above the
+        # rim, a target_dy of -500 is physically unreachable and the
+        # bot stalls until WAIT_TIMEOUT_S forces a blind shot. Cap the
+        # drift relative to the nearest make's recorded dy (a known
+        # workable baseline at a similar rim) so corrections stay in
+        # range that the ball can actually match.
+        anchor_dy = nearest.dy
+        max_drift = self.DIRECTIONAL_CORRECTION_MAX_PX
+        if target_dy > anchor_dy + max_drift:
+            target_dy = anchor_dy + max_drift
+        elif target_dy < anchor_dy - max_drift:
+            target_dy = anchor_dy - max_drift
         bx, by = ball.center
         cur_dy = by - ry
         delta = abs(cur_dy - target_dy)
@@ -240,6 +345,9 @@ class SimpleRimStrategy(Strategy):
         # Remember which make's pattern we just committed to — notify_outcome
         # will use this to credit/blame the make for the resulting outcome.
         self._last_used_make = nearest
+        # Record the dy we're actually clicking at, for the next throw's
+        # streak correction to anchor against.
+        self._last_click_dy = cur_dy
         return True
 
     def mark_thrown(self) -> None:
@@ -257,6 +365,9 @@ class SimpleRimStrategy(Strategy):
             self._misses_since_score = 0
             self._undershoot_streak = 0
             self._overshoot_streak = 0
+            # New rim coming on next throw — last_click_dy no longer
+            # describes a relevant launch position.
+            self._last_click_dy = None
             # The make's failure counter is also reset by this outcome —
             # tracked + cleared in _record_outcome_for_make below.
             self._record_outcome_for_make(outcome)
@@ -271,13 +382,18 @@ class SimpleRimStrategy(Strategy):
             print(f"[strategy] overshoot streak = {self._overshoot_streak}")
             self._record_outcome_for_make(outcome)
         elif outcome == "no_launch":
-            # The dy was probably fine; the click hit a dead spot in the
-            # swing and gave the ball no horizontal velocity. Don't bias
-            # the dy correction streaks — instead, mark this make as
-            # suspect so we rotate to a different one next throw.
+            # On a stationary rim there's no swing phase for "dead spot"
+            # to mean anything — a no_launch just means the ball didn't
+            # travel far enough horizontally, which is identical in
+            # effect to an undershoot. Treat it as one so the next throw
+            # launches from a higher point. (Oscillation has its own
+            # no_launch handling for moving rims; this branch is only
+            # reached when simple is actively in charge.)
+            self._undershoot_streak += 1
+            self._overshoot_streak = 0
             print(
-                f"[strategy] no_launch — click timing missed; "
-                f"NOT biasing dy, will rotate makes"
+                f"[strategy] no_launch (treating as undershoot) "
+                f"streak = {self._undershoot_streak}"
             )
             self._record_outcome_for_make(outcome)
 
@@ -312,6 +428,7 @@ class SimpleRimStrategy(Strategy):
         self._undershoot_streak = 0
         self._overshoot_streak = 0
         self._last_used_make = None
+        self._last_click_dy = None
         self._last_wait_reason = ""
         self._last_wait_log_at = 0.0
 

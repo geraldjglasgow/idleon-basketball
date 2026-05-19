@@ -46,9 +46,11 @@ from rim_tracker import RimSample
 from .base import Strategy
 from .oscillation_model import RimOscillationModel
 from .shared import (
-    _Make,
+    MissIndex,
     MOVING_RIM_MIN_SCORE,
+    _Make,
     load_makes,
+    load_misses,
     measure_ball_flight_s,
 )
 from .simple import SimpleRimStrategy
@@ -56,7 +58,8 @@ from .simple import SimpleRimStrategy
 
 class OscillationStrategy(Strategy):
     DY_TOLERANCE_PX = 25
-    COOLDOWN_S = 4.0
+    # Matches SimpleRimStrategy's 2 s cooldown — see comment there.
+    COOLDOWN_S = 2.0
     # Class default used when too few past makes exist to measure
     # empirically. __init__ replaces self.BALL_FLIGHT_S with the median
     # rim-crossing time from past makes when measurement is reliable.
@@ -150,6 +153,14 @@ class OscillationStrategy(Strategy):
     NO_LAUNCH_BACKOFF_THRESHOLD = 2
     NO_LAUNCH_BACKOFF_PERIODS = 1.0
 
+    # A make is quarantined for the rest of the session after this many
+    # consecutive non-make outcomes attributed to it. Set to 1 because
+    # the rim's oscillation is deterministic — if make X produced a miss
+    # this period, the rim returns to X's recorded position next period
+    # and we'd reproduce the same miss. One failure is enough signal to
+    # stop trusting that make and rotate to a different alignment.
+    MAX_CONSECUTIVE_FAILURES_PER_MAKE = 1
+
     def __init__(self, throws_log_path: Path | str) -> None:
         path = Path(throws_log_path)
         self._fallback = SimpleRimStrategy(path)
@@ -165,6 +176,10 @@ class OscillationStrategy(Strategy):
         self._moving_makes: list[_Make] = [
             m for m in self._all_makes if m.rim_moving is True
         ]
+        # Historical misses index for negative learning — same as the
+        # fallback strategy uses, but consulted from oscillation's own
+        # alignment search.
+        self._misses_index = MissIndex(load_misses(path))
         self._oscillation = RimOscillationModel()
 
         self.last_throw_at: float = time.perf_counter()
@@ -194,6 +209,20 @@ class OscillationStrategy(Strategy):
         # Diagnostic streaks for adaptive dy bias (mirrors SimpleRimStrategy).
         self._undershoot_streak: int = 0
         self._overshoot_streak: int = 0
+        # The dy the bot actually clicked at on its most recent throw.
+        # When a streak is active, the correction anchors off this
+        # value rather than the rotated make's recorded dy — rotation
+        # alone can swing the base by hundreds of px and override the
+        # streak's intended shift. Cleared on make / game-reset.
+        self._last_click_dy: int | None = None
+        # Per-make quarantine state. The make whose recorded rim_x we
+        # aligned to for the most recent click — set inside
+        # `_should_throw_oscillating` when it returns True, consumed by
+        # `notify_outcome` to credit/blame that make. Failure counts and
+        # quarantines persist across games (a bad make stays bad).
+        self._last_used_make: _Make | None = None
+        self._make_failure_counts: dict[int, int] = {}
+        self._quarantined_makes: set[int] = set()
         # When the ball repeatedly fails to launch (click landed in a
         # dead phase of the swing), backing off a full period before the
         # next attempt shifts the click into a different phase. Without
@@ -208,7 +237,9 @@ class OscillationStrategy(Strategy):
 
         print(
             f"OscillationStrategy: loaded {len(self._all_makes)} make(s) "
-            f"({len(self._moving_makes)} on a moving rim) from {path}; "
+            f"({len(self._moving_makes)} on a moving rim), "
+            f"{self._misses_index.total} miss(es) for negative learning "
+            f"from {path}; "
             f"BALL_FLIGHT_S={self.BALL_FLIGHT_S:.2f}s"
         )
 
@@ -251,17 +282,19 @@ class OscillationStrategy(Strategy):
 
     def notify_outcome(self, outcome: str) -> None:
         # Always pass through to fallback so its directional streaks stay
-        # current — they're useful if we ever revert. Note: the fallback's
-        # per-make quarantine only fires for throws that went through its
-        # should_throw path (i.e. score < 10). In oscillation mode the
-        # fallback's _last_used_make stays None, so no quarantine happens.
-        # That's intentional for now — with only ~13 moving-rim makes,
-        # aggressive quarantining could empty the candidate set fast.
+        # current — they're useful if we ever revert. The fallback has
+        # its own quarantine state for shots taken through its
+        # should_throw path (score < 10 or oscillation's no-alignment
+        # bypass); we maintain a separate quarantine here for shots
+        # picked by oscillation mode itself.
         self._fallback.notify_outcome(outcome)
         if outcome == "make":
             self._undershoot_streak = 0
             self._overshoot_streak = 0
             self._no_launch_streak = 0
+            # Rim teleports after a make — last click's dy no longer
+            # describes a relevant launch position.
+            self._last_click_dy = None
         elif outcome == "undershoot":
             self._undershoot_streak += 1
             self._overshoot_streak = 0
@@ -292,6 +325,37 @@ class OscillationStrategy(Strategy):
                     )
         # unknown: don't bias the dy streaks.
 
+        self._record_outcome_for_make(outcome)
+
+    def _record_outcome_for_make(self, outcome: str) -> None:
+        """Update the per-make failure counter for the make that produced
+        the most recent oscillation-mode throw, and quarantine it once
+        the count hits MAX_CONSECUTIVE_FAILURES_PER_MAKE. A make outcome
+        clears the counter so a genuinely-good make stays usable."""
+        m = self._last_used_make
+        # Clear immediately so a future throw without an intervening
+        # should_throw->return-True doesn't double-count.
+        self._last_used_make = None
+        if m is None:
+            return
+        key = id(m)
+        if outcome == "make":
+            if self._make_failure_counts.pop(key, 0):
+                print(
+                    f"[strategy] make at ({m.rim_x}, {m.rim_y}) — "
+                    f"resetting its failure counter"
+                )
+            return
+        count = self._make_failure_counts.get(key, 0) + 1
+        self._make_failure_counts[key] = count
+        if count >= self.MAX_CONSECUTIVE_FAILURES_PER_MAKE:
+            self._quarantined_makes.add(key)
+            print(
+                f"[strategy] QUARANTINING make at ({m.rim_x}, {m.rim_y}) "
+                f"after {count} consecutive failures (last: {outcome}); "
+                f"won't be picked again this session"
+            )
+
     # If the plausibility gate rejects the same value this many times in
     # a row, accept it on the next read. That value is too persistent to
     # be a one-off misread — it's either a real game state we missed
@@ -321,6 +385,11 @@ class OscillationStrategy(Strategy):
         self._oscillation = RimOscillationModel()
         self._last_wait_reason = ""
         self._last_wait_log_at = 0.0
+        # Drop the in-flight make pointer; quarantines + failure counts
+        # persist (a make that consistently misses is bad data, and a
+        # new game doesn't change that).
+        self._last_used_make = None
+        self._last_click_dy = None
         # Forward to fallback so its score-memory + streaks reset too —
         # otherwise the simple strategy's _last_observed_score from the
         # previous game would mis-evaluate the new game's progression.
@@ -501,6 +570,16 @@ class OscillationStrategy(Strategy):
         if not candidates:
             candidates = same_level_makes
 
+        # Drop quarantined makes — each missed once already this session,
+        # and the rim's deterministic oscillation means we'd reproduce
+        # those misses if we picked them again. Fall back to the
+        # un-filtered set only if quarantining empties everything.
+        non_quarantined = [
+            m for m in candidates if id(m) not in self._quarantined_makes
+        ]
+        if non_quarantined:
+            candidates = non_quarantined
+
         # Find the soonest t* where the rim's x at arrival matches a
         # candidate make's recorded rim_x. y is already accounted for by
         # the same-level filter above, and the in-game rim doesn't move
@@ -561,6 +640,11 @@ class OscillationStrategy(Strategy):
                 f"(off by {delta}, tol={self.DY_TOLERANCE_PX}, "
                 f"stroke={live_stroke})"
             )
+        # Commit — remember which make's pattern produced this throw so
+        # notify_outcome can credit the right one. Record the click dy
+        # too so the next streak correction anchors against it.
+        self._last_used_make = target_make
+        self._last_click_dy = cur_dy
         return True
 
     def _find_soonest_alignment(
@@ -588,6 +672,16 @@ class OscillationStrategy(Strategy):
         now = time.perf_counter()
         horizon_s = period * self.SEARCH_HORIZON_PERIODS
         steps = max(1, int(math.ceil(horizon_s / self.SEARCH_STEP_S)))
+        # Pre-sort candidates by historical miss density at their
+        # signature (fewer misses near = checked earlier). Within a
+        # given time step, multiple candidates may be within
+        # MAKE_MATCH_TOLERANCE_PX — by ordering ascending on miss count,
+        # the first perfect match found is the one with the fewest
+        # historical failures at its signature.
+        candidates = sorted(
+            candidates,
+            key=lambda m: self._misses_index.count_near(m.rim_x, m.rim_y, m.dy),
+        )
         # Track the smallest |x_arrival - make.rim_x| across all
         # (k, make) pairs as a fallback. We can't return early during
         # the perfect-match pass without giving up on best-effort.
@@ -615,26 +709,41 @@ class OscillationStrategy(Strategy):
             return (m, t_s, arr, d, False)
         return None
 
-    # Match SimpleRimStrategy's directional-correction tuning. Step + cap
-    # raised because real undershoots in the wild were 200+ px and the
-    # old 90 px cap couldn't recover from them.
-    DIRECTIONAL_CORRECTION_STEP_PX = 50
+    # Match SimpleRimStrategy's directional-correction tuning. Step
+    # bumped to 80 (from 50) so a single miss produces a visibly
+    # different launch position on the next throw.
+    DIRECTIONAL_CORRECTION_STEP_PX = 80
     DIRECTIONAL_CORRECTION_MAX_PX = 200
 
     def _adjusted_target_dy(self, base_dy: int) -> int:
         """Apply directional correction (under/overshoot streaks) to the
-        target dy, same idea as SimpleRimStrategy.DIRECTIONAL_CORRECTION_*."""
-        if self._undershoot_streak > 0:
-            return base_dy - min(
+        target dy. When a streak is active and we have a previous
+        click's dy on record, anchor the correction to that — otherwise
+        rotation through different makes can override the streak shift
+        and even reverse direction. Cold-start (no last click) falls
+        back to base_dy. Result is clamped to ±DIRECTIONAL_CORRECTION_MAX_PX
+        of `base_dy` so the walked anchor can't drift into physically
+        unreachable values where the bot stalls waiting for the ball."""
+        if self._undershoot_streak > 0 and self._last_click_dy is not None:
+            target = self._last_click_dy - self.DIRECTIONAL_CORRECTION_STEP_PX
+        elif self._overshoot_streak > 0 and self._last_click_dy is not None:
+            target = self._last_click_dy + self.DIRECTIONAL_CORRECTION_STEP_PX
+        elif self._undershoot_streak > 0:
+            target = base_dy - min(
                 self.DIRECTIONAL_CORRECTION_STEP_PX * self._undershoot_streak,
                 self.DIRECTIONAL_CORRECTION_MAX_PX,
             )
-        if self._overshoot_streak > 0:
-            return base_dy + min(
+        elif self._overshoot_streak > 0:
+            target = base_dy + min(
                 self.DIRECTIONAL_CORRECTION_STEP_PX * self._overshoot_streak,
                 self.DIRECTIONAL_CORRECTION_MAX_PX,
             )
-        return base_dy
+        else:
+            return base_dy
+        return max(
+            base_dy - self.DIRECTIONAL_CORRECTION_MAX_PX,
+            min(base_dy + self.DIRECTIONAL_CORRECTION_MAX_PX, target),
+        )
 
     def _stroke(self) -> str | None:
         history = list(self._ball_y_history)

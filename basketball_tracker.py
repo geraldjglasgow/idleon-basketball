@@ -20,6 +20,9 @@ import numpy as np
 
 from screen_capture import Region
 
+# (left, top, width, height) — same shape regions.py exports.
+ScreenRect = tuple[int, int, int, int]
+
 
 @dataclass(frozen=True)
 class BasketballSample:
@@ -58,10 +61,18 @@ class BasketballTracker:
     # while rejecting 400+ px jumps to remote UI blobs.
     POSITION_CONTINUITY_PX = 250
 
-    def __init__(self) -> None:
+    def __init__(self, hud_exclusions: tuple[ScreenRect, ...] = ()) -> None:
         # Last accepted ball center, in screen coords. Used to filter
         # frame-to-frame jumps that would indicate a wrong-blob lock-on.
         self._last_center: tuple[int, int] | None = None
+        # Screen-space rectangles to zero out of the orange mask before
+        # blob detection — UI elements (throw-zone slot, inventory item,
+        # buttons) that contain orange and otherwise pass every filter.
+        # Without this the tracker can lock onto a static HUD icon and
+        # never re-acquire the in-flight ball; symptom is throws.jsonl
+        # rows where ball_x/ball_y are pinned to a HUD pixel for the
+        # whole 2.8 s trajectory.
+        self._hud_exclusions = tuple(hud_exclusions)
 
     def read(self, frame: np.ndarray, frame_origin: Region) -> BasketballSample | None:
         """Find an orange blob that's both ball-shaped AND consistent with
@@ -69,6 +80,7 @@ class BasketballTracker:
         plausible is found."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.ORANGE_HSV_LOW, self.ORANGE_HSV_HIGH)
+        self._zero_hud(mask, frame_origin)
         n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if n_labels <= 1:
             return None
@@ -127,3 +139,20 @@ class BasketballTracker:
             height=h,
             confidence=float(area),
         )
+
+    def _zero_hud(self, mask: np.ndarray, frame_origin: Region) -> None:
+        """Black out HUD rectangles in `mask` so their orange pixels can't
+        produce candidate blobs. Rectangles are in screen coords; convert
+        to frame coords via `frame_origin`, then clip to the mask bounds."""
+        if not self._hud_exclusions:
+            return
+        oy = frame_origin["top"]
+        ox = frame_origin["left"]
+        h, w = mask.shape
+        for left, top, width, height in self._hud_exclusions:
+            x0 = max(0, left - ox)
+            y0 = max(0, top - oy)
+            x1 = min(w, left - ox + width)
+            y1 = min(h, top - oy + height)
+            if x1 > x0 and y1 > y0:
+                mask[y0:y1, x0:x1] = 0

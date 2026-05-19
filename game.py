@@ -15,7 +15,14 @@ import lobby
 from basketball_tracker import BasketballSample, BasketballTracker
 from game_over_detector import is_game_over
 from preview_window import LabeledBox, PreviewWindow
-from regions import EXIT_BUTTON_REGION, GAME_OVER_REGION, SCORE_REGION, THROW_ZONE
+from regions import (
+    EXIT_BUTTON_REGION,
+    GAME_OVER_REGION,
+    ITEM_BASKETBALL,
+    ITEMS_BUTTON,
+    SCORE_REGION,
+    THROW_ZONE,
+)
 from rim_motion_tracker import RimMotionTracker
 from rim_tracker import RimSample, RimTracker
 from score_reader import ScoreReader
@@ -31,6 +38,12 @@ THROWS_LOG_PATH = Path(__file__).parent / "throws.jsonl"
 # bot is almost certainly not actually in a game — the score region
 # isn't displaying a number to read. Force a lobby pass to recover.
 MAX_CONSECUTIVE_DROPS = 3
+# Watchdog: if the strategy hasn't fired in this long, force a
+# best-effort click anyway. Strategies refuse to throw when they can't
+# classify stroke / find alignment / etc.; without a forced shot we'd
+# sit silent indefinitely. A forced shot at least feeds an outcome back
+# to the strategy and keeps the score progressing.
+FORCE_THROW_AFTER_S = 120.0
 
 
 def _basketball_overlay(sample: BasketballSample, frame_origin: Region) -> LabeledBox:
@@ -90,7 +103,16 @@ def run(
     strategy (see `strategies` package). Assumes the game has already
     been started."""
     capture_region = primary_monitor_region()
-    basketball_tracker = BasketballTracker()
+    # Mask UI regions that contain orange (throw-zone slot, inventory ball
+    # icon, items button) so the tracker can't latch onto a static HUD
+    # element instead of the in-flight ball.
+    basketball_tracker = BasketballTracker(
+        hud_exclusions=(
+            tuple(THROW_ZONE),
+            tuple(ITEM_BASKETBALL),
+            tuple(ITEMS_BUTTON),
+        ),
+    )
     rim_tracker = RimTracker()
     score_reader = ScoreReader()
     score_region = SCORE_REGION._asdict()
@@ -108,6 +130,10 @@ def run(
     # a lobby recovery on the next iteration.
     consecutive_drops = [0]
     needs_lobby_recovery = [False]
+    # Wallclock of the last click into the throw zone (strategy or
+    # watchdog-forced). Drives FORCE_THROW_AFTER_S. List so the closure
+    # below can mutate it.
+    last_attempt_at = [time.perf_counter()]
 
     def _on_throw_finalized(record: dict) -> None:
         consecutive_drops[0] = 0
@@ -179,6 +205,7 @@ def run(
                     lobby.start_game(preview=preview)
                     consecutive_drops[0] = 0
                     needs_lobby_recovery[0] = False
+                    last_attempt_at[0] = time.perf_counter()
                     continue
 
                 if needs_lobby_recovery[0]:
@@ -192,22 +219,42 @@ def run(
                     lobby.start_game(preview=preview)
                     consecutive_drops[0] = 0
                     needs_lobby_recovery[0] = False
+                    last_attempt_at[0] = time.perf_counter()
                     continue
 
                 auto_enabled = (
                     hotkey_listener is None or hotkey_listener.auto_enabled
                 )
-                if auto_enabled and strategy.should_throw(ball, rim, rim_motion):
+                strategy_says_throw = strategy.should_throw(ball, rim, rim_motion)
+                # Tier-1 watchdog: strategy has been stalling — force a
+                # best-effort shot. The strategy may be waiting on stroke
+                # / alignment / dy that never arrive (static-blob ball
+                # lock-on, model not ready, etc); a forced click feeds an
+                # outcome back to the strategy and keeps the score moving.
+                force_throw = (
+                    auto_enabled
+                    and not strategy_says_throw
+                    and time.perf_counter() - last_attempt_at[0]
+                    > FORCE_THROW_AFTER_S
+                )
+                if auto_enabled and (strategy_says_throw or force_throw):
                     cx = throw_zone["left"] + throw_zone["width"] // 2
                     cy = throw_zone["top"] + throw_zone["height"] // 2
                     click(cx, cy)
                     strategy.mark_thrown()
-                    predicted = rim_motion.predict(strategy.BALL_FLIGHT_S)
-                    print(
-                        f"[strategy] throw clicked at ({cx}, {cy}) — "
-                        f"ball={ball.center} rim={rim.center} "
-                        f"predicted_rim={predicted}"
-                    )
+                    last_attempt_at[0] = time.perf_counter()
+                    if force_throw:
+                        print(
+                            f"[game] watchdog: forcing best-effort throw "
+                            f"after {FORCE_THROW_AFTER_S:.0f}s of strategy stalling"
+                        )
+                    else:
+                        predicted = rim_motion.predict(strategy.BALL_FLIGHT_S)
+                        print(
+                            f"[strategy] throw clicked at ({cx}, {cy}) — "
+                            f"ball={ball.center} rim={rim.center} "
+                            f"predicted_rim={predicted}"
+                        )
 
                 now = time.perf_counter()
                 if now - last_score_at >= SCORE_READ_INTERVAL_S:
